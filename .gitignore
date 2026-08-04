@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+*.xlsx
+*.csv
+id_*.txt
