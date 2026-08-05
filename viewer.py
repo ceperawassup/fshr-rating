@@ -1,5 +1,6 @@
 import sqlite3
 import argparse
+from collections import defaultdict
 from config import DAUGHTER_ID
 
 DB_NAME = "ratings.db"
@@ -8,7 +9,6 @@ def get_latest_snapshots(tag=None, birth_year=None, sort_by="classic_fshr"):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    # Базовый запрос: последний снапшот для каждого игрока
     query = '''
         SELECT p.id, p.name, p.birth_year, p.region_code, p.tags,
                s.classic_fshr, s.rapid_fshr, s.blitz_fshr,
@@ -21,7 +21,6 @@ def get_latest_snapshots(tag=None, birth_year=None, sort_by="classic_fshr"):
     params = []
 
     if tag:
-        # Поддержка нескольких тегов через запятую
         tags = [t.strip() for t in tag.split(",")]
         tag_conditions = []
         for t in tags:
@@ -42,7 +41,6 @@ def get_latest_snapshots(tag=None, birth_year=None, sort_by="classic_fshr"):
     if conditions:
         query += " AND " + " AND ".join(conditions)
 
-    # Сортировка — теперь явно указываем s.column
     sort_map = {
         "classic_fshr": "s.classic_fshr",
         "rapid_fshr": "s.rapid_fshr",
@@ -59,6 +57,20 @@ def get_latest_snapshots(tag=None, birth_year=None, sort_by="classic_fshr"):
     conn.close()
     return rows
 
+def get_all_matches(player_ids):
+    """Возвращает словарь {player_id: [result, ...]} для переданных id."""
+    if not player_ids:
+        return {}
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    placeholders = ','.join(['?']*len(player_ids))
+    c.execute(f'SELECT player_id, result FROM matches WHERE player_id IN ({placeholders}) ORDER BY date', player_ids)
+    d = defaultdict(list)
+    for pid, res in c.fetchall():
+        d[pid].append(res)
+    conn.close()
+    return d
+
 def print_table(rows, sort_by, top=None, show_fide=False):
     if not rows:
         print("Нет данных по заданным фильтрам.")
@@ -67,21 +79,24 @@ def print_table(rows, sort_by, top=None, show_fide=False):
     if top:
         rows = rows[:top]
 
-    # Индексы колонок в возвращаемом кортеже:
-    # 0-id, 1-name, 2-birth, 3-region, 4-tags,
-    # 5-classic_fshr, 6-rapid_fshr, 7-blitz_fshr,
-    # 8-classic_fide, 9-rapid_fide, 10-blitz_fide
+    # Собираем все id для запроса встреч
+    all_ids = [row[0] for row in rows]
+    matches_dict = get_all_matches(all_ids)
+
+    result_icon = {'win': '🟢', 'draw': '🟡', 'loss': '🔴'}
+
     if sort_by.startswith("classic"):
         main_idx = 5
         fide_idx = 8
     elif sort_by.startswith("rapid"):
         main_idx = 6
         fide_idx = 9
-    else:  # blitz
+    else:
         main_idx = 7
         fide_idx = 10
 
-    header = f"{'Место':<5} {'ФШР ID':<8} {'Имя':<30} {'Год':<6} {'Рег':<6} {'Рейтинг':>8}"
+    # Заголовок (ширина колонки "Встр" до 5 символов)
+    header = f"{'Место':<5} {'ID':<8} {'Имя':<30} {'Год':<6} {'Рег':<6} {'Рейт':>6} {'Встр':<5}"
     if show_fide:
         header += f" {'ФИДЕ':>8}"
     print(header)
@@ -92,25 +107,38 @@ def print_table(rows, sort_by, top=None, show_fide=False):
         main_rating = row[main_idx]
         fide_rating = row[fide_idx] if show_fide else None
 
-        is_daughter = (fshr_id == DAUGHTER_ID)
-        prefix = "🔹 " if is_daughter else "  "
-        line = f"{prefix}{i:<3} {fshr_id:<8} {name:<30} {birth:<6} {region:<6} {main_rating:>8}"
+        # Иконки встреч
+        match_results = matches_dict.get(fshr_id, [])
+        icons = ''.join(result_icon.get(r, '?') for r in match_results)
+
+        prefix = "🔹 " if fshr_id == DAUGHTER_ID else "  "
+        line = f"{prefix}{i:<3} {fshr_id:<8} {name:<30} {birth:<6} {region:<6} {main_rating:>6} {icons:<5}"
         if show_fide:
             line += f" {fide_rating:>8}"
         print(line)
 
-    # Поиск дочери в списке
+    # Место дочери
     daughter_row = next((r for r in rows if r[0] == DAUGHTER_ID), None)
     if daughter_row:
         position = rows.index(daughter_row) + 1
         print(f"\n🔹 Алёна Никитина находится на {position}-м месте из {len(rows)} участниц.")
     else:
-        print("\nАлёна Никитина не найдена в выборке (возможно, не участвовала или нет данных).")
+        print("\nАлёна Никитина не найдена в выборке.")
+
+    # Сводка всех встреч
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*), result FROM matches GROUP BY result')
+    stats = {row[1]: row[0] for row in c.fetchall()}
+    conn.close()
+    if stats:
+        print("\nЛичные встречи (всего):")
+        print(f"  Побед: {stats.get('win', 0)}, Ничьих: {stats.get('draw', 0)}, Поражений: {stats.get('loss', 0)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Просмотр рейтингов ФШР")
-    parser.add_argument("--tag", default=None, help="Фильтр по тегу, например szfo_classical или несколько через запятую")
-    parser.add_argument("--birth", default=None, help="Год рождения или диапазон, например 2015 или 2015-2016")
+    parser.add_argument("--tag", default=None, help="Фильтр по тегу")
+    parser.add_argument("--birth", default=None, help="Год рождения или диапазон")
     parser.add_argument("--sort", default="classic_fshr", choices=["classic_fshr", "rapid_fshr", "blitz_fshr"],
                         help="По какому рейтингу сортировать")
     parser.add_argument("--top", type=int, default=None, help="Показать только N лучших")
