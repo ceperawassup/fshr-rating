@@ -1,7 +1,7 @@
 import sqlite3
 import argparse
 from collections import defaultdict
-from config import DAUGHTER_ID
+from config import DAUGHTER_ID, TOURNAMENT_DATES
 
 DB_NAME = "ratings.db"
 
@@ -57,8 +57,20 @@ def get_latest_snapshots(tag=None, birth_year=None, sort_by="classic_fshr"):
     conn.close()
     return rows
 
+def get_start_snapshot(player_id, date_str):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''
+        SELECT classic_fshr, rapid_fshr, blitz_fshr
+        FROM ratings_snapshots
+        WHERE player_id = ? AND date <= ?
+        ORDER BY date DESC LIMIT 1
+    ''', (player_id, date_str))
+    row = c.fetchone()
+    conn.close()
+    return row if row else (0, 0, 0)
+
 def get_all_matches(player_ids):
-    """Возвращает словарь {player_id: [result, ...]} для переданных id."""
     if not player_ids:
         return {}
     conn = sqlite3.connect(DB_NAME)
@@ -71,7 +83,7 @@ def get_all_matches(player_ids):
     conn.close()
     return d
 
-def print_table(rows, sort_by, top=None, show_fide=False):
+def print_table(rows, sort_by, top=None, show_fide=False, delta_tag=None):
     if not rows:
         print("Нет данных по заданным фильтрам.")
         return
@@ -79,24 +91,30 @@ def print_table(rows, sort_by, top=None, show_fide=False):
     if top:
         rows = rows[:top]
 
-    # Собираем все id для запроса встреч
     all_ids = [row[0] for row in rows]
     matches_dict = get_all_matches(all_ids)
 
-    result_icon = {'win': '🟢', 'draw': '🟡', 'loss': '🔴'}
-
+    # Определяем индекс рейтинга в строке (5-classic, 6-rapid, 7-blitz)
     if sort_by.startswith("classic"):
         main_idx = 5
-        fide_idx = 8
     elif sort_by.startswith("rapid"):
         main_idx = 6
-        fide_idx = 9
     else:
         main_idx = 7
-        fide_idx = 10
 
-    # Заголовок (ширина колонки "Встр" до 5 символов)
-    header = f"{'Место':<5} {'ID':<8} {'Имя':<30} {'Год':<6} {'Рег':<6} {'Рейт':>6} {'Встр':<5}"
+    # Если задан delta_tag, получаем дату турнира
+    tournament_date = None
+    if delta_tag and delta_tag in TOURNAMENT_DATES:
+        tournament_date = TOURNAMENT_DATES[delta_tag]
+
+    result_icon = {'win': '🟢', 'draw': '🟡', 'loss': '🔴'}
+
+    # ANSI-цвета для дельты
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+
+    header = f"{'Место':<5} {'ID':<8} {'Имя':<30} {'Год':<6} {'Рег':<6} {'Рейт':>6} {'Δ':>4} {'Встр':<5}"
     if show_fide:
         header += f" {'ФИДЕ':>8}"
     print(header)
@@ -104,15 +122,31 @@ def print_table(rows, sort_by, top=None, show_fide=False):
 
     for i, row in enumerate(rows, start=1):
         fshr_id, name, birth, region, tags = row[0], row[1], row[2], row[3], row[4]
-        main_rating = row[main_idx]
-        fide_rating = row[fide_idx] if show_fide else None
+        current_rating = row[main_idx]
+        fide_rating = row[8] if show_fide else None
+
+        # Дельта с цветом
+        delta_str = " · "
+        if tournament_date:
+            start_ratings = get_start_snapshot(fshr_id, tournament_date)
+            start_rating = start_ratings[main_idx - 5]  # 0-classic,1-rapid,2-blitz
+            if start_rating:
+                diff = current_rating - start_rating
+                if diff > 0:
+                    delta_str = f"{GREEN}{diff:+4d}{RESET}"
+                elif diff < 0:
+                    delta_str = f"{RED}{diff:+4d}{RESET}"
+                else:
+                    delta_str = f"  0 "
+            else:
+                delta_str = "  n/a"
 
         # Иконки встреч
         match_results = matches_dict.get(fshr_id, [])
         icons = ''.join(result_icon.get(r, '?') for r in match_results)
 
         prefix = "🔹 " if fshr_id == DAUGHTER_ID else "  "
-        line = f"{prefix}{i:<3} {fshr_id:<8} {name:<30} {birth:<6} {region:<6} {main_rating:>6} {icons:<5}"
+        line = f"{prefix}{i:<3} {fshr_id:<8} {name:<30} {birth:<6} {region:<6} {current_rating:>6} {delta_str:>4} {icons:<5}"
         if show_fide:
             line += f" {fide_rating:>8}"
         print(line)
@@ -125,7 +159,7 @@ def print_table(rows, sort_by, top=None, show_fide=False):
     else:
         print("\nАлёна Никитина не найдена в выборке.")
 
-    # Сводка всех встреч
+    # Сводка встреч
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('SELECT COUNT(*), result FROM matches GROUP BY result')
@@ -143,7 +177,8 @@ if __name__ == "__main__":
                         help="По какому рейтингу сортировать")
     parser.add_argument("--top", type=int, default=None, help="Показать только N лучших")
     parser.add_argument("--fide", action="store_true", help="Показывать также рейтинг ФИДЕ")
+    parser.add_argument("--delta-tag", default=None, help="Тег турнира для отображения прироста (например, rf_26_blitz)")
     args = parser.parse_args()
 
     rows = get_latest_snapshots(tag=args.tag, birth_year=args.birth, sort_by=args.sort)
-    print_table(rows, sort_by=args.sort, top=args.top, show_fide=args.fide)
+    print_table(rows, sort_by=args.sort, top=args.top, show_fide=args.fide, delta_tag=args.delta_tag)
