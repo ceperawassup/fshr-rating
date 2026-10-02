@@ -1,7 +1,9 @@
 venv/
 __pycache__/
 *.pyc
-*.db
+#*.db
+ratings_backup.db
+ratings_backup1.db
 *.xlsx
 *.csv
 id_*.txt
